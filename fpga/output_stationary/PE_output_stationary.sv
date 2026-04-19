@@ -1,0 +1,46 @@
+module pe_output_stationary #(
+    parameter DATA_WIDTH = 8,
+    parameter ACCUM_WIDTH = 16
+)(
+    input  logic                   clk,   // Clock signal
+    input  logic                   rst,   // Reset signal
+    input  logic                   en,    // Enable signal (calculate output)
+    input  logic                   drain, // Enable shadow register shift
+    input  logic [DATA_WIDTH-1:0]  a_in,  // Activation Register input
+    input  logic [DATA_WIDTH-1:0]  b_in,  // Weight Register input
+    input  logic [ACCUM_WIDTH-1:0] c_in,  // Partial Sum input
+    output logic [DATA_WIDTH-1:0]  a_out, // Activation Register output
+    output logic [DATA_WIDTH-1:0]  b_out, // Weigth Register output
+    output logic [ACCUM_WIDTH-1:0] c_out // Partial Sum output
+    
+);
+    logic [ACCUM_WIDTH-1:0] c_accum;   // Store accumulated results
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            a_out <= '0;
+            b_out <= '0;
+            c_out <= '0;
+            c_accum <= '0;
+        end else if (en) begin
+            // Pass data to the next PEs in the array
+            a_out <= a_in;
+            b_out <= b_in;
+            
+            if (drain) begin
+               // move the current accumulation to c_out
+               c_out <= ((a_in == '0) || (b_in == '0)) ? c_accum : c_accum + (a_in * b_in);
+
+               // reset internal c_accum register to begin next sum
+               c_accum <= '0;
+            end else begin
+              // Multiply and accumulate (if a_in or b_in are 0, skip multiply)
+              c_accum <= (((a_in == '0) || (b_in == '0)) ? c_accum : c_accum + (a_in * b_in));
+              
+              // shift accum registers downward
+              c_out <= c_in;
+            end
+        end
+    end
+
+endmodule

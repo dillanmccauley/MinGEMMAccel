@@ -1,0 +1,61 @@
+module systolic_array_output_stationary #(
+    parameter DATA_WIDTH  = 8,
+    parameter ACCUM_WIDTH = 16,
+    parameter ARRAY_SIZE  = 4
+)(
+    input  logic clk,
+    input  logic rst,
+    input  logic en,
+    input  logic drain,
+    
+    // Streaming inputs: one element per row/col per clock
+    input  wire logic [DATA_WIDTH-1:0]  a_in [ARRAY_SIZE-1:0],
+    input  wire logic [DATA_WIDTH-1:0]  b_in [ARRAY_SIZE-1:0],
+
+    // Streaming Output: one row per clock cycle
+    output logic [ACCUM_WIDTH-1:0] c_out [ARRAY_SIZE-1:0]
+);
+
+    // Interconnect wires between PEs
+    // a_wire connects left-to-right, b_wire connects top-to-bottom
+    logic [DATA_WIDTH-1:0] a_wire [ARRAY_SIZE-1:0][ARRAY_SIZE:0];
+    logic [DATA_WIDTH-1:0] b_wire [ARRAY_SIZE:0][ARRAY_SIZE-1:0];
+  
+    // Accumulated wires
+    logic [ACCUM_WIDTH-1:0] c_wire [ARRAY_SIZE:0][ARRAY_SIZE-1:0];
+
+    // Assign top-level streaming inputs to the array boundaries
+    genvar i, j;
+    generate
+        for (i = 0; i < ARRAY_SIZE; i++) begin : assign_inputs
+            assign a_wire[i][0] = a_in[i];
+            assign b_wire[0][i] = b_in[i];
+            assign c_out[i] = c_wire[ARRAY_SIZE][i];
+            assign c_wire[0][i] = '0;
+        end
+    endgenerate
+
+    // Generate the grid of Processing Elements
+    generate
+        for (i = 0; i < ARRAY_SIZE; i++) begin : row
+            for (j = 0; j < ARRAY_SIZE; j++) begin : col
+                pe_output_stationary #(
+                    .DATA_WIDTH(DATA_WIDTH),
+                    .ACCUM_WIDTH(ACCUM_WIDTH)
+                ) pe_inst (
+                    .clk   (clk),
+                    .rst   (rst),
+                    .en    (en),
+                    .drain (drain),
+                    .a_in  (a_wire[i][j]),
+                    .b_in  (b_wire[i][j]),
+                    .c_in  (c_wire[i][j]),
+                    .a_out (a_wire[i][j+1]),
+                    .b_out (b_wire[i+1][j]),
+                    .c_out (c_wire[i+1][j])
+                );
+            end
+        end
+    endgenerate
+
+endmodule
