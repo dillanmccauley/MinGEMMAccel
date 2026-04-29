@@ -1,7 +1,8 @@
 `timescale 1ns/1ps
+`include "gemm_pkg.sv"
 
 module tb_systolic_array_output_stationary;
-
+    import gemm_pkg::*;
     parameter DATA_WIDTH  = 8;
     parameter ACCUM_WIDTH = 16;
     parameter ARRAY_SIZE  = 3; 
@@ -11,6 +12,11 @@ module tb_systolic_array_output_stationary;
     logic [DATA_WIDTH-1:0]  b_in  [ARRAY_SIZE-1:0];
     logic [ACCUM_WIDTH-1:0] c_out [ARRAY_SIZE-1:0]; // Streaming output
 
+    logic [$clog2(COL_COLS)-1:0]  col_idx;
+    logic [$clog2(COL_COLS)-1:0]  row_idx;
+    logic [IMG_ABITS-1:0]         img_addr;
+    logic                         pad_pixel;
+    
     // DUT Instantiation
     systolic_array_output_stationary #(
         .DATA_WIDTH(DATA_WIDTH),
@@ -18,19 +24,23 @@ module tb_systolic_array_output_stationary;
         .ARRAY_SIZE(ARRAY_SIZE)
     ) dut (.*); // Use .* for brevity if names match
 
+   im2col_addr_gen addr_gen(.*);
+
     initial begin
         clk = 0;
         forever #5 clk = ~clk;
     end
 
-    real image[3][3] = '{ '{1, 2, 3}, '{4, 5, 6}, '{7, 8, 9} };
+    real image[9] = '{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
     real kernel_flat[9] = '{9, 8, 7, 6, 5, 4, 3, 2, 1};
     real current_windows[3][9];
     int  expected_C [3][3] = '{ '{26, 56, 54}, '{84, 165, 144}, '{134, 236, 186} };
     int  errors = 0;
-
+    int col_accum = 0;
+    int row_accum = 0;
    	// Helper Function: Extracts a 3x3 window and flattens it
-    function void get_window(input int center_row, input int center_col, output real flat_out[9]);
+     /*
+     function void get_window(input int center_row, input int center_col, output real flat_out[9]);
         automatic int idx = 0;
         for (int r = center_row - 1; r <= center_row + 1; r++) begin
             for (int c = center_col - 1; c <= center_col + 1; c++) begin
@@ -43,7 +53,7 @@ module tb_systolic_array_output_stationary;
             end
         end
     endfunction
-
+    */
     initial begin
         // Reset
         rst = 1; en = 0; drain = 0;
@@ -51,9 +61,20 @@ module tb_systolic_array_output_stationary;
         
         @(negedge clk);
         rst = 0; en = 1;
-
         for (int pass = 0; pass < 3; pass++) begin
-            for (int col_idx = 0; col_idx < 3; col_idx++) get_window(pass, col_idx, current_windows[col_idx]);
+            //for (int col_idx = 0; col_idx < 3; col_idx++) get_window(pass, col_idx, current_windows[col_idx]);
+	    for (int col = 0; col < 3; col++) begin
+		col_idx = row_accum;
+		row_idx = col_accum;
+                #(1);
+                if(pad_pixel == '1) begin
+		   	current_windows[pass][col] = '0;
+		end else begin
+			current_windows[pass][col] = image[img_addr];
+		end
+		row_accum += 1;
+                col_accum += 1;
+            end
 
             $display("--- Pass %0d: Streaming Inputs ---", pass);
 

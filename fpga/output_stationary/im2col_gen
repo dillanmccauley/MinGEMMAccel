@@ -1,0 +1,87 @@
+// im2col_addr_gen.sv
+//
+// Address Generator
+// -----------------
+// Given an output column index (col_idx in [0, OH*OW)) and a row index
+// within the column (row_idx in [0, kH*kW*C)), this module:
+//   1. Decomposes row_idx ? (c, kh, kw)
+//   2. Decomposes col_idx ? (oh, ow)
+//   3. Computes the input pixel coordinates with stride and padding:
+//        h_in = oh*STRIDE + kh - PAD
+//        w_in = ow*STRIDE + kw - PAD
+//   4. If h_in or w_in is out of bounds ? pad_pixel = 1 (emit zero)
+//   5. Otherwise emits the flat CHW address: (c*H + h_in)*W + w_in
+//
+// This is purely combinational ? the calling engine registers the output.
+
+`include "im2col_pkg.sv"
+
+module im2col_addr_gen
+  import im2col_pkg::*;
+(
+  // Column being processed
+  input  logic [$clog2(COL_COLS)-1:0]  col_idx,   // 0 .. OH*OW-1
+  // Row within the column (which element of the kernel patch)
+  input  logic [$clog2(COL_ROWS)-1:0]  row_idx,   // 0 .. kH*kW*C-1
+
+  // Outputs
+  output logic [IMG_ABITS-1:0]         img_addr,  // flat CHW index
+  output logic                         pad_pixel   // asserted ? emit zero
+);
+
+  // -----------------------------------------------------------------------
+  // Decompose row_idx ? (c, kh, kw)
+  // Row layout: row = c*(kH*kW) + kh*kW + kw
+  // -----------------------------------------------------------------------
+  logic [$clog2(IMG_C+1)-1:0]   r_c;
+  logic [$clog2(KH+1)-1:0]      r_kh;
+  logic [$clog2(KW+1)-1:0]      r_kw;
+  logic [$clog2(KH*KW+1)-1:0]   r_hw_idx;  // kh*kW + kw
+
+  always_comb begin
+    r_c      = int'(row_idx) / (KH * KW);
+    r_hw_idx = int'(row_idx) % (KH * KW);
+    r_kh     = int'(r_hw_idx) / KW;
+    r_kw     = int'(r_hw_idx) % KW;
+  end
+
+  // -----------------------------------------------------------------------
+  // Decompose col_idx ? (oh, ow)
+  // Column layout: col = oh*OW + ow
+  // -----------------------------------------------------------------------
+  logic [$clog2(OH+1)-1:0]  c_oh;
+  logic [$clog2(OW+1)-1:0]  c_ow;
+
+  always_comb begin
+    c_oh = int'(col_idx) / OW;
+    c_ow = int'(col_idx) % OW;
+  end
+
+  // -----------------------------------------------------------------------
+  // Input coordinates (need signed arithmetic for padding check)
+  // -----------------------------------------------------------------------
+  logic signed [$clog2(IMG_H*2+KH)-1:0] h_in_s;
+  logic signed [$clog2(IMG_W*2+KW)-1:0] w_in_s;
+
+  always_comb begin
+    h_in_s = $signed({1'b0, c_oh}) * STRIDE + $signed({1'b0, r_kh}) - PAD;
+    w_in_s = $signed({1'b0, c_ow}) * STRIDE + $signed({1'b0, r_kw}) - PAD;
+  end
+
+  // -----------------------------------------------------------------------
+  // Padding check and address output
+  // -----------------------------------------------------------------------
+  always_comb begin
+    if (h_in_s < 0 || h_in_s >= IMG_H ||
+        w_in_s < 0 || w_in_s >= IMG_W) begin
+      pad_pixel = 1'b1;
+      img_addr  = '0;
+    end else begin
+      pad_pixel = 1'b0;
+      img_addr  = pixel_addr(int'(r_c),
+                             int'(h_in_s[0+:$clog2(IMG_H+1)]),
+                             int'(w_in_s[0+:$clog2(IMG_W+1)]));
+    end
+  end
+
+endmodule : im2col_addr_gen
