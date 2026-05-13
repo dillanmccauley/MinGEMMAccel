@@ -1,254 +1,84 @@
-`timescale 1ns/1ps
-`include "gemm_pkg.sv"
-
 // =============================================================================
-// tb_systolic_array_output_stationary
+// systolic_array_output_stationary.sv  ?  final
 //
-// Fix log vs previous version:
+// Bug fixed: multiple drivers on b_wire[i][0] for i=1..8.
+//   Previous version drove b_wire[i][0] from BOTH the generate assign
+//   AND pe(i-1,0).b_out via port connection ? simultaneous drivers.
+//   ModelSim warned vsim-3839 and resolved to X, producing garbage results.
 //
-//   Bug 1 ? All lanes produced the same output.
-//     Cause:  a single kernel_flat was broadcast to every lane, so all K lanes
-//             were computing identical dot products.
-//     Fix:    Define K distinct weight rows (one per filter lane).  Each lane k
-//             feeds weight_matrix[k][...] so the K accumulators diverge.
+//   Fix: remove b_wire entirely for the b dimension. Each PE's b_in port
+//   connects DIRECTLY to b_in[i] from the external port. b_out is left
+//   unconnected (parallel input mode ? no b pipeline propagation needed).
+//   This eliminates the multi-driver completely.
 //
-//   Bug 2 ? Results arrived one column late (col_idx=N output appeared at N+1).
-//     Cause:  drain was asserted at i == COL_ROWS + ARRAY_SIZE - 2, then
-//             repeat(ARRAY_SIZE-2) extra cycles were waited before sampling.
-//             Together these pushed the sample point one full streaming pass
-//             beyond the valid output window.
-//     Fix:    Assert drain at i == COL_ROWS - 1 (the last real MAC cycle for
-//             lane 0), then wait exactly ARRAY_SIZE - 1 cycles for the result
-//             to ripple to c_out before sampling.
-//
-//   Bug 3 ? expected_C only had 3 columns; the loop ran all 9.
-//     Cause:  The original array was written for 3 output positions but
-//             COL_COLS = OH*OW = 9 for a 3x3 image with same-padding.
-//     Fix:    Compute all 9 expected values from the weight matrix and the
-//             im2col matrix so they are always consistent with the actual data.
+// The c chain now works because pe_output_stationary.c_out is combinational
+// on drain ? c_wire is a combinational adder chain during drain, giving
+// c_wire[ROWS] = sum of all PE accumulators in a single clock cycle.
 // =============================================================================
-
-module tb_systolic_array_output_stationary;
-    import gemm_pkg::*;
-
-    // -------------------------------------------------------------------------
-    // Parameters
-    // -------------------------------------------------------------------------
-    parameter DATA_WIDTH  = 8;
-    parameter ACCUM_WIDTH = 32;   // widened: 9 MACs of 8b×8b can reach 9*255*255=585,225 > 2^16
-    parameter ARRAY_SIZE  = 3;    // K = 3 filter lanes
-
-    // -------------------------------------------------------------------------
-    // DUT ports
-    // -------------------------------------------------------------------------
-    logic clk, rst, en, drain;
-    logic [DATA_WIDTH-1:0]  a_in  [ARRAY_SIZE-1:0];
-    logic [DATA_WIDTH-1:0]  b_in  [ARRAY_SIZE-1:0];
-    logic [ACCUM_WIDTH-1:0] c_out [ARRAY_SIZE-1:0];
-
-    // -------------------------------------------------------------------------
-    // addr gen ports ? dedicated names, never aliased to DUT
-    // -------------------------------------------------------------------------
-    logic [$clog2(COL_COLS)-1:0] ag_col_idx;
-    logic [$clog2(COL_ROWS)-1:0] ag_row_idx;
-    logic [IMG_ABITS-1:0]        ag_img_addr;
-    logic                        ag_pad_pixel;
-
-    // -------------------------------------------------------------------------
-    // DUT instantiation ? explicit port map
-    // -------------------------------------------------------------------------
-    systolic_array_output_stationary #(
-        .DATA_WIDTH  (DATA_WIDTH),
-        .ACCUM_WIDTH (ACCUM_WIDTH),
-        .ARRAY_SIZE  (ARRAY_SIZE)
-    ) dut (
-        .clk   (clk),
-        .rst   (rst),
-        .en    (en),
-        .drain (drain),
-        .a_in  (a_in),
-        .b_in  (b_in),
-        .c_out (c_out)
-    );
-
-    // -------------------------------------------------------------------------
-    // Address generator ? explicit port map
-    // -------------------------------------------------------------------------
-    im2col_addr_gen addr_gen (
-        .col_idx   (ag_col_idx),
-        .row_idx   (ag_row_idx),
-        .img_addr  (ag_img_addr),
-        .pad_pixel (ag_pad_pixel)
-    );
-
-    // -------------------------------------------------------------------------
-    // Clock
-    // -------------------------------------------------------------------------
-    initial begin
-        clk = 0;
-        forever #5 clk = ~clk;
-    end
-
-    // -------------------------------------------------------------------------
-    // Memory and matrix storage
-    // -------------------------------------------------------------------------
-
-    // Flat CHW image SRAM (C=1, H=3, W=3 ? 9 words)
-    logic [DATA_WIDTH-1:0] image_sram [0:8];
-
-    // FIX 1: K distinct weight rows ? one per filter lane.
-    // weight_matrix[k][r] = weight for filter k, kernel position r (0..COL_ROWS-1).
-    // Using three different kernels so lane outputs are distinguishable:
-    //   F0: [9,8,7,6,5,4,3,2,1]  (descending)
-    //   F1: [1,2,3,4,5,6,7,8,9]  (ascending)
-    //   F2: [1,0,1,0,1,0,1,0,1]  (checkerboard)
-    logic [DATA_WIDTH-1:0] weight_matrix [0:ARRAY_SIZE-1][0:COL_ROWS-1];
-
-    // im2col matrix: [col_idx][row_idx] ? built by addr gen
-    logic [DATA_WIDTH-1:0] im2col_mat [0:COL_COLS-1][0:COL_ROWS-1];
-
-    // FIX 3: Expected results computed from data, not hardcoded.
-    // Computed in software before streaming so they are always consistent.
-    logic [ACCUM_WIDTH-1:0] expected_C [0:COL_COLS-1][0:ARRAY_SIZE-1];
-
-    int errors = 0;
-
-    // -------------------------------------------------------------------------
-    // Task: compute expected outputs (pure software reference model)
-    // expected_C[ci][k] = sum over r of weight_matrix[k][r] * im2col_mat[ci][r]
-    // -------------------------------------------------------------------------
-    task automatic compute_expected();
-        for (int ci = 0; ci < COL_COLS; ci++) begin
-            for (int k = 0; k < ARRAY_SIZE; k++) begin
-                automatic logic [ACCUM_WIDTH-1:0] acc = '0;
-                for (int r = 0; r < COL_ROWS; r++) begin
-                    acc += ACCUM_WIDTH'(weight_matrix[k][r]) *
-                           ACCUM_WIDTH'(im2col_mat[ci][r]);
-                end
-                expected_C[ci][k] = acc;
+module systolic_array_output_stationary #(
+    parameter DATA_WIDTH  = 8,
+    parameter ACCUM_WIDTH = 32,
+    parameter ROWS        = 9,
+    parameter COLS        = 1
+)(
+    input  logic clk,
+    input  logic rst,
+    input  logic en,
+    input  logic drain,
+    // a_in[k]: weight for PE row k ? constant across all passes (K=1)
+    // b_in[k]: activation for PE row k ? all driven simultaneously (parallel)
+    input  logic [DATA_WIDTH-1:0]  a_in  [ROWS-1:0],
+    input  logic [DATA_WIDTH-1:0]  b_in  [ROWS-1:0],
+    output logic [ACCUM_WIDTH-1:0] c_out [COLS-1:0]
+);
+    // a_wire: carries weight across columns (left to right)
+    logic [DATA_WIDTH-1:0]  a_wire [ROWS-1:0][COLS:0];
+ 
+    // c_wire: carries partial sums down the column (top to bottom)
+    // With combinational PE c_out on drain, this is a combinational chain.
+    logic [ACCUM_WIDTH-1:0] c_wire [ROWS:0][COLS-1:0];
+ 
+    // b_wire removed ? b_in[i] connects directly to each PE row.
+    // No multi-driver conflict possible.
+ 
+    genvar i, j;
+ 
+    // Column output and initial condition
+    generate
+        for (i = 0; i < COLS; i++) begin : assign_cols
+            assign c_out[i]     = c_wire[ROWS][i];
+            assign c_wire[0][i] = '0;
+        end
+    endgenerate
+ 
+    // Weight inputs: one per PE row
+    generate
+        for (i = 0; i < ROWS; i++) begin : assign_rows
+            assign a_wire[i][0] = a_in[i];
+        end
+    endgenerate
+ 
+    // PE grid: b_in[i] connects directly ? no b_wire, no multi-driver
+    generate
+        for (i = 0; i < ROWS; i++) begin : row
+            for (j = 0; j < COLS; j++) begin : col
+                pe_output_stationary #(
+                    .DATA_WIDTH  (DATA_WIDTH),
+                    .ACCUM_WIDTH (ACCUM_WIDTH)
+                ) pe_inst (
+                    .clk   (clk),
+                    .rst   (rst),
+                    .en    (en),
+                    .drain (drain),
+                    .a_in  (a_wire[i][j]),
+                    .b_in  (b_in[i]),          // direct parallel connection ? no b_wire
+                    .c_in  (c_wire[i][j]),
+                    .a_out (a_wire[i][j+1]),
+                    .b_out (),                  // unconnected ? parallel mode has no b propagation
+                    .c_out (c_wire[i+1][j])
+                );
             end
         end
-    endtask
-
-    // -------------------------------------------------------------------------
-    // Main stimulus
-    // -------------------------------------------------------------------------
-    initial begin
-
-        // --- Initialise image and weights ---
-        image_sram = '{ 8'd1, 8'd2, 8'd3,
-                        8'd4, 8'd5, 8'd6,
-                        8'd7, 8'd8, 8'd9 };
-
-        weight_matrix[0] = '{ 8'd9, 8'd8, 8'd7, 8'd6, 8'd5, 8'd4, 8'd3, 8'd2, 8'd1 };
-        weight_matrix[1] = '{ 8'd1, 8'd2, 8'd3, 8'd4, 8'd5, 8'd6, 8'd7, 8'd8, 8'd9 };
-        weight_matrix[2] = '{ 8'd1, 8'd0, 8'd1, 8'd0, 8'd1, 8'd0, 8'd1, 8'd0, 8'd1 };
-
-        // --- Reset ---
-        rst = 1; en = 0; drain = 0;
-        for (int i = 0; i < ARRAY_SIZE; i++) begin
-            a_in[i] = '0;
-            b_in[i] = '0;
-        end
-        @(negedge clk);
-        rst = 0; en = 1;
-
-        // =====================================================================
-        // STEP 1 ? Build im2col matrix via addr gen (combinational, no clock)
-        //
-        // col_idx (ag_col_idx): 0..COL_COLS-1  ? output spatial position
-        // row_idx (ag_row_idx): 0..COL_ROWS-1  ? kernel element (c, kh, kw)
-        // =====================================================================
-        $display("--- Building im2col matrix via addr_gen ---");
-
-        for (int ci = 0; ci < COL_COLS; ci++) begin
-            for (int ri = 0; ri < COL_ROWS; ri++) begin
-                ag_col_idx = ci[$clog2(COL_COLS)-1:0];
-                ag_row_idx = ri[$clog2(COL_ROWS)-1:0];
-                #1; // combinational settle ? no clock edge needed
-
-                im2col_mat[ci][ri] = ag_pad_pixel ? '0 : image_sram[ag_img_addr];
-
-                $display("  col_idx=%0d row_idx=%0d | pad=%0b addr=%0d val=%0d",
-                          ci, ri, ag_pad_pixel, ag_img_addr, im2col_mat[ci][ri]);
-            end
-        end
-
-        // =====================================================================
-        // STEP 2 ? Compute software-reference expected outputs
-        // =====================================================================
-        compute_expected();
-        $display("--- Expected outputs (software reference) ---");
-        for (int ci = 0; ci < COL_COLS; ci++) begin
-            $write("  col_idx=%0d: ", ci);
-            for (int k = 0; k < ARRAY_SIZE; k++)
-                $write("F%0d=%0d  ", k, expected_C[ci][k]);
-            $display("");
-        end
-
-        // =====================================================================
-        // STEP 3 ? Stream im2col columns through the systolic array
-        //
-        // Each iteration processes one im2col column (one output spatial position).
-        //
-        // Skew model: lane k receives element (i-k) on streaming cycle i.
-        // Valid input window for lane k: i in [k, k+COL_ROWS-1].
-        //
-        // FIX 2 ? Drain and sample timing:
-        //   ? Assert drain at i == COL_ROWS - 1.
-        //     This is the cycle lane 0 finishes its last MAC.  The drain signal
-        //     tells the accumulator to latch and clear on the *next* clock edge.
-        //   ? After the streaming loop ends, wait (ARRAY_SIZE - 1) cycles for
-        //     the latched result to propagate through to c_out, then sample.
-        // =====================================================================
-        for (int ci = 0; ci < COL_COLS; ci++) begin
-            $display("--- Streaming col_idx=%0d ---", ci);
-
-            for (int i = 0; i < COL_ROWS + ARRAY_SIZE - 1; i++) begin
-
-                // Drain when lane 0 completes its final MAC (cycle COL_ROWS-1).
-                // Later lanes are still computing their last elements but the
-                // output-stationary array's drain captures the final accumulated
-                // value, so the timing must align with lane 0's completion.
-                drain = (i == COL_ROWS - 1);
-
-                for (int k = 0; k < ARRAY_SIZE; k++) begin
-                    if (i >= k && (i - k) < COL_ROWS) begin
-                        a_in[k] = weight_matrix[k][i-k];   // FIX 1: per-lane weight
-                        b_in[k] = im2col_mat[ci][i-k];     // activation from im2col column
-                    end else begin
-                        a_in[k] = '0;
-                        b_in[k] = '0;
-                    end
-                end
-
-                @(negedge clk);
-            end
-
-            drain = 0;
-
-            // Wait for result to ripple through all ARRAY_SIZE pipeline stages
-            // to c_out.  Lane (ARRAY_SIZE-1) finishes (ARRAY_SIZE-1) cycles
-            // after lane 0, so we wait exactly that many cycles before sampling.
-            repeat(ARRAY_SIZE - 1) @(negedge clk);
-
-            // --- Verification ---
-            for (int k = 0; k < ARRAY_SIZE; k++) begin
-                if (c_out[k] !== expected_C[ci][k]) begin
-                    $display("FAIL col_idx=%0d lane=%0d: expected=%0d got=%0d",
-                              ci, k, expected_C[ci][k], c_out[k]);
-                    errors++;
-                end else begin
-                    $display("PASS col_idx=%0d lane=%0d: got=%0d", ci, k, c_out[k]);
-                end
-            end
-        end
-
-        // =====================================================================
-        // Summary
-        // =====================================================================
-        $display("\nSimulation Finished. Errors: %0d", errors);
-        $finish;
-    end
-
+    endgenerate
+ 
 endmodule
